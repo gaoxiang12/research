@@ -12,6 +12,7 @@
 #include <opencv2/features2d/features2d.hpp>
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/nonfree/nonfree.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
 #include <opencv/cv.h>
 
 //PCL
@@ -40,6 +41,7 @@ struct PLANE
     vector<KeyPoint> kp;             //关键点:图像位置
     vector<Point3f> kp_pos;        //关键点的3D位置
     Mat desp;                               //描述子
+    Mat image;                             //图像
 };
 
 struct TRANSFORM //变换矩阵
@@ -61,6 +63,7 @@ double match_min_dist = 30; //最大匹配距离
 double camera_factor = 5000; //相机参数
 double camera_fx = 520.9, camera_fy = 521.0, camera_cx = 325.1, camera_cy = 249.7;
 double min_error_plane = 0.5;  //归类关键点时的最小误差
+vector<DMatch> inlierMatches;
 //////////////////////////////////////////////////
 void usage()
 {
@@ -84,6 +87,8 @@ void readData(string file1, string file2)
 }
 
 vector<PLANE> extractPlanes(PointCloud::Ptr cloud);  //从两个点云中分割平面
+void generateImage(PLANE& plane, Mat& depth);                              //根据平面的参数生成图像蒙板
+void compute3dPosition(PLANE& plane, Mat& depth);   
 vector<KeyPoint> extractKeypoints(cv::Mat image);     //从图像中提取关键点，默认为SIFT
 Mat extractDescriptor(Mat image, vector<KeyPoint>& kp);  //根据关键点提取特征
 vector<DMatch> match(vector<PLANE>& planes1, vector<PLANE>& planes2);  //匹配两组平面，以法向量作为特征
@@ -123,15 +128,17 @@ int main(int argc, char** argv)
         pcl::ModelCoefficients c = planes1[i].coff;
         cout<<"Model coefficients of plane "<<i<<": "
             <<c.values[0]<<", "<<c.values[1]<<", "<<c.values[2]<<", "<<c.values[3]<<endl;
+        planes1[i].image = rgb1.clone();
     }
 
     cout<<"planes of cloud2: "<<endl;
     planes2 = extractPlanes( cloud2 );
-    for (size_t i = 0; i<planes1.size(); i++)
+    for (size_t i = 0; i<planes2.size(); i++)
     {
         pcl::ModelCoefficients c = planes2[i].coff;
         cout<<"Model coefficients of plane "<<i<<": "
             <<c.values[0]<<", "<<c.values[1]<<", "<<c.values[2]<<", "<<c.values[3]<<endl;
+        planes2[i].image = rgb2.clone();
     }
 
     //match two planes，以两组平面的法向量为基本特征
@@ -142,6 +149,24 @@ int main(int argc, char** argv)
         cout<<matches[i].queryIdx<<" --- "<<matches[i].trainIdx<<endl; //query在前，train在后
     }
 
+    //尝试生成各平面的二维图像供opencv分析
+    for (size_t i=0; i<planes1.size(); i++)
+    {
+        generateImage(planes1[i], dep1);
+        planes1[i].kp = extractKeypoints( planes1[i].image);
+        Mat image_keypoints;
+        drawKeypoints( planes1[i].image, planes1[i].kp, image_keypoints );
+        
+        imshow("keypoints", image_keypoints);
+        waitKey(0);
+    }
+
+    for (size_t i=0; i<planes2.size(); i++)
+    {
+        generateImage( planes2[i], dep2 );
+        planes2[i].kp = extractKeypoints( planes2[i].image);
+    }
+    /*
     //提取两张图片中的SIFT关键点
     vector<KeyPoint> kp1 = extractKeypoints( rgb1 );
     vector<KeyPoint> kp2 = extractKeypoints( rgb2 );
@@ -177,20 +202,20 @@ int main(int argc, char** argv)
         imshow("classify",image_keypoints);
         waitKey(0);
     }
+    */
     //根据两组平面的匹配关系，对KeyPoint进行匹配
-    cout<<"data in planes 1"<<endl;
+    //生成描述子    并 计算各关键点的3d位置
     for (size_t i = 0; i<planes1.size(); i++)
     {
-        cout<<"group 1 plane "<<i<<" total keypoint is "<<planes1[i].kp.size()<<endl;
         planes1[i].desp = extractDescriptor( rgb1, planes1[i].kp );
+        compute3dPosition( planes1[i], dep1 );
     }
-    cout<<"data in planes 2"<<endl;
     for (size_t i = 0; i<planes2.size(); i++)
     {
-        cout<<"group 2 plane "<<i<<" total keypoint is "<<planes2[i].kp.size()<<endl;
         planes2[i].desp = extractDescriptor( rgb2, planes2[i].kp );
+        compute3dPosition( planes2[i], dep2 );
     }
-
+    
     //分别匹配两组平面上的特征点
     cout<<"Using RANSAC to compute Transform Matrix."<<endl;
     vector<TRANSFORM> transforms;
@@ -200,8 +225,8 @@ int main(int argc, char** argv)
         TRANSFORM t = PnP( planes1[matches[i].queryIdx], planes2[matches[i].trainIdx] );
         transforms.push_back(t);
 
-        Eigen::Matrix4f T = PnPUsingICP( planes1[matches[i].queryIdx], planes2[matches[i].trainIdx] );
-        cout<<"result of ICP: "<<T<<endl;
+        //Eigen::Matrix4f T = PnPUsingICP( planes1[matches[i].queryIdx], planes2[matches[i].trainIdx] );
+        //cout<<"result of ICP: "<<endl<<T<<endl;
     }
 
     cout<<"Transforms: "<<endl;
@@ -244,6 +269,12 @@ vector<PLANE> extractPlanes(PointCloud::Ptr cloud)
         PLANE p;
         p.coff = *coefficients;
         
+        if ( coefficients->values[3] < 0)
+        {
+            for (int i=0; i<4; i++)
+                p.coff.values[i] = -p.coff.values[i];
+        }
+        
         planes.push_back(p);
 
         pcl::ExtractIndices<PointT> extract;
@@ -262,7 +293,7 @@ vector<DMatch> match(vector<PLANE>& planes1, vector<PLANE>& planes2)
     FlannBasedMatcher matcher;
     vector<DMatch> matches;
     cv::Mat des1(planes1.size(), 4, CV_32F), des2(planes2.size(), 4, CV_32F);
-    
+    cout<<"start matching two planes"<<endl;
     for (size_t i=0; i<planes1.size(); i++)
     {
         pcl::ModelCoefficients c = planes1[i].coff;
@@ -341,9 +372,10 @@ vector<DMatch> match( Mat desp1, Mat desp2 )
 vector<KeyPoint> extractKeypoints(Mat image)
 {
     initModule_nonfree();
-    Ptr<FeatureDetector> detector = FeatureDetector::create("FAST");
+    Ptr<FeatureDetector> detector = FeatureDetector::create("STAR");
     vector<KeyPoint> kp;
     detector->detect(image, kp);
+
     return kp;
 }
 
@@ -383,6 +415,24 @@ int classifyKeypoints(KeyPoint kp, vector<PLANE>& planes, Mat depth, Point3f& po
     return min_error_index;
 }
 
+void compute3dPosition(PLANE& plane, Mat& depth)
+{
+    for (size_t i=0; i<plane.kp.size(); i++)
+    {
+        double u = plane.kp[i].pt.x, v = plane.kp[i].pt.y;
+        unsigned short d = depth.at<unsigned short>(round(v), round(u));
+        if (d == 0)
+        {
+            plane.kp_pos.push_back( Point3f(0,0,0) );
+            continue;
+        }
+        double x = double(d)/camera_factor;
+        double y = -( u - camera_cx) * x / camera_fx;
+        double z = -( v - camera_cy) * x / camera_fy;
+        plane.kp_pos.push_back(Point3f( x, y, z) );
+    }
+}
+
 Mat extractDescriptor( Mat image, vector<KeyPoint>& kp)
 {
     Ptr<DescriptorExtractor> descriptor_extractor = DescriptorExtractor::create( "SIFT" );
@@ -396,11 +446,7 @@ TRANSFORM PnP(PLANE& p1, PLANE& p2)
 {
     vector<DMatch> matches = match(p1.desp, p2.desp);
     cout<<"good matches: "<<matches.size()<<endl;
-    //画出匹配结果
-    Mat image_matches;
-    drawMatches(rgb1, p1.kp, rgb2, p2.kp, matches, image_matches, Scalar::all(-1), CV_RGB(255,255,255), Mat(), 4);
-    imshow("match", image_matches);
-    waitKey(0);
+
 
     //这是用cv的solvePnPRANSAC
     vector<Point3f> obj;  //目标点（cv坐标系下）
@@ -418,6 +464,10 @@ TRANSFORM PnP(PLANE& p1, PLANE& p2)
 
     Mat inliers;     
     solvePnPRansac(obj, img, cameraMatrix, Mat(), rvec, tvec, false, 100, 8.0, 100, inliers);
+    inlierMatches.clear();
+    for (int i=0; i<inliers.rows; i++)
+        inlierMatches.push_back( matches[inliers.at<int>(i,0)] );
+    
     t.rvec = rvec;
     t.tvec = tvec;
     cout<<"inliers = "<<inliers.rows<<endl;
@@ -425,13 +475,18 @@ TRANSFORM PnP(PLANE& p1, PLANE& p2)
     {
         cerr<<"No enough inliers."<<endl;
     }
+    //画出匹配结果
+    Mat image_matches;
+    drawMatches(rgb1, p1.kp, rgb2, p2.kp, inlierMatches, image_matches, Scalar::all(-1), CV_RGB(255,255,255), Mat(), 4);
+    imshow("match", image_matches);
+    waitKey(0);
     return t;
 
 }
 
 Eigen::Matrix4f PnPUsingICP(PLANE& p1, PLANE& p2)
 {
-    vector<DMatch> matches = match(p1.desp, p2.desp);
+    vector<DMatch>& matches = inlierMatches;
     //构造待匹配的点云
     pcl::PointCloud<pcl::PointXYZ>::Ptr src(new pcl::PointCloud<pcl::PointXYZ>()), tgt(new pcl::PointCloud<pcl::PointXYZ>());
     for (size_t i=0; i<matches.size(); i++)
@@ -450,10 +505,9 @@ Eigen::Matrix4f PnPUsingICP(PLANE& p1, PLANE& p2)
     pcl::io::savePCDFile( "./data/src.pcd", *src );
     pcl::io::savePCDFile( "./data/tgt.pcd", *tgt );
     cout<<"source and target pointcloud is saved."<<endl;
-    waitKey(0);
     //参数
     // Set the max correspondence distance to 5cm (e.g., correspondences with higher distances will be ignored)
-    icp.setMaxCorrespondenceDistance (0.2);
+    icp.setMaxCorrespondenceDistance (0.05);
     // Set the maximum number of iterations (criterion 1)
     icp.setMaximumIterations (50);
     // Set the transformation epsilon (criterion 2)
@@ -465,8 +519,51 @@ Eigen::Matrix4f PnPUsingICP(PLANE& p1, PLANE& p2)
     icp.align(final);
 
     cout<<"icp has converged: "<<icp.hasConverged()<<endl;
-    
-    Eigen::Matrix4f T = icp.getFinalTransformation();
+    Eigen::Matrix4f T = icp.getFinalTransformation(); //T是从src到tgt的变换
+
+    if (icp.hasConverged())
+    {
+        //输出结果
+        PointCloud::Ptr output( new PointCloud() );
+        pcl::transformPointCloud( *cloud1, *output, T );
+        *output += *cloud2;
+        pcl::io::savePCDFile("./data/final.pcd", *output);
+        cout<<"result is saved. Please check ./data/final.pcd "<<endl;
+        waitKey(0);
+    }
     return T;
 
+}
+
+void generateImage( PLANE& plane, Mat& depth )
+{
+    for( int i=0; i<plane.image.cols; i++)
+        for (int j=0; j<plane.image.rows; j++)
+        {
+            unsigned short d = depth.at<unsigned short>(j, i);
+            if (d == 0)
+            {
+                plane.image.at<unsigned char>( j, i) = 0;
+                continue;
+            }
+
+            //看此点是否位于平面上
+            double x = double(d)/camera_factor;
+            double y = -( i - camera_cx) * x / camera_fx;
+            double z = -( j - camera_cy) * x / camera_fy;
+            
+            double e = plane.coff.values[0]*x + plane.coff.values[1]*y + plane.coff.values[2]*z + plane.coff.values[3];
+            e*=e;
+            if ( e<0.02 )
+            {
+                //认为该点位于此平面
+            }
+            else
+                plane.image.at<unsigned char> (j, i) = 0;
+        }
+
+    //将图像做一次直方图均衡化
+    Mat dst;
+    equalizeHist( plane.image, dst );
+    plane.image = dst.clone();
 }
