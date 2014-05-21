@@ -7,6 +7,10 @@
 #include <string>
 #include <sstream>
 #include <algorithm>
+//Eigen
+#include <Eigen/Core>
+#include <Eigen/Geometry>
+
 //CV
 #include <opencv2/core/core.hpp>
 #include <opencv2/features2d/features2d.hpp>
@@ -14,6 +18,7 @@
 #include <opencv2/nonfree/nonfree.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
 #include <opencv/cv.h>
+#include <opencv2/core/eigen.hpp>
 
 //PCL
 #include <pcl/ModelCoefficients.h>
@@ -25,15 +30,26 @@
 #include <pcl/filters/extract_indices.h>
 #include <pcl/registration/icp.h>
 
-//Eigen
-#include <Eigen/Core>
-#include <Eigen/Geometry>
+//g2o
+#include <g2o/types/slam3d/types_slam3d.h>
+#include <g2o/core/sparse_optimizer.h>
+#include <g2o/core/block_solver.h>
+#include <g2o/core/factory.h>
+#include <g2o/core/optimization_algorithm_factory.h>
+#include <g2o/core/optimization_algorithm_gauss_newton.h>
+#include <g2o/solvers/csparse/linear_solver_csparse.h>
+#include <g2o/core/robust_kernel.h>
+#include <g2o/core/robust_kernel_factory.h>
 
 using namespace std;
 using namespace cv;
+using namespace g2o;
 
 typedef pcl::PointXYZRGBA PointT;
 typedef pcl::PointCloud<PointT> PointCloud;
+
+typedef g2o::BlockSolver< BlockSolverTraits<-1,-1>> SlamBockSolver;
+typedef LinearSolverCSparse<SlamBlockSolver::PoseMatrixType> SlamLinearSolver;
 
 struct PLANE
 {
@@ -42,12 +58,6 @@ struct PLANE
     vector<Point3f> kp_pos;        //关键点的3D位置
     Mat desp;                               //描述子
     Mat image;                             //图像
-};
-
-struct TRANSFORM //变换矩阵
-{
-    Mat rvec;
-    Mat tvec;
 };
 
 //////////////////////////////////////////////////
@@ -61,8 +71,8 @@ double distance_threshold = 0.05; //error of each plane model
 double percent = 0.3;   //percent of planes in each pointcloud
 double match_min_dist = 30; //最大匹配距离
 double camera_factor = 5000; //相机参数
-double camera_fx = 520.9, camera_fy = 521.0, camera_cx = 325.1, camera_cy = 249.7;
-double min_error_plane = 0.5;  //归类关键点时的最小误差
+double camera_fx = 517.0, camera_fy = 517.0, camera_cx = 318.6, camera_cy = 255.3;
+double min_error_plane = 0.01;  //归类关键点时的最小误差
 vector<DMatch> inlierMatches;
 //////////////////////////////////////////////////
 void usage()
@@ -94,7 +104,7 @@ Mat extractDescriptor(Mat image, vector<KeyPoint>& kp);  //根据关键点提取
 vector<DMatch> match(vector<PLANE>& planes1, vector<PLANE>& planes2);  //匹配两组平面，以法向量作为特征
 vector<DMatch> match(Mat desp1, Mat desp2);  //匹配两组特征点
 int classifyKeypoints(KeyPoint kp, vector<PLANE>& planes, Mat depth, Point3f& pos);  //将特征点根据不同的平面进行归类
-TRANSFORM PnP(PLANE& p1, PLANE& p2);  //求解PnP问题
+Eigen::Isometry3d PnP(PLANE& p1, PLANE& p2);  //求解PnP问题
 Eigen::Matrix4f PnPUsingICP( PLANE& p1, PLANE& p2); //用pcl中的ICP求解PnP问题
 //////////////////////////////////////////////////
 //坐标变换
@@ -166,43 +176,7 @@ int main(int argc, char** argv)
         generateImage( planes2[i], dep2 );
         planes2[i].kp = extractKeypoints( planes2[i].image);
     }
-    /*
-    //提取两张图片中的SIFT关键点
-    vector<KeyPoint> kp1 = extractKeypoints( rgb1 );
-    vector<KeyPoint> kp2 = extractKeypoints( rgb2 );
-    cout<<"Keypoint size = "<<kp1.size()<<","<<kp2.size()<<endl;
-    //将两组关键点归类到平面中去
-    for (size_t i=0; i<kp1.size(); i++)
-    {
-        Point3f pos;
-        int index = classifyKeypoints(kp1[i], planes1, dep1, pos);
-        if (index != -1)
-        {
-            planes1[index].kp.push_back(kp1[i]);
-            planes1[index].kp_pos.push_back( pos );
-        }
-    }
-    for (size_t i=0; i<kp2.size(); i++)
-    {
-        Point3f pos;
-        int index = classifyKeypoints(kp2[i], planes2, dep2, pos);
-        if (index != -1)
-        {
-            planes2[index].kp.push_back( kp2[i] );
-            planes2[index].kp_pos.push_back( pos );
-        }
-    }
-
-    //画一下归类结果
-    //第一帧图像中，plane1分别是板子，左侧箱子以及地板
-    for (size_t i=0; i<planes1.size(); i++)
-    {
-        Mat image_keypoints;
-        drawKeypoints( rgb1, planes1[i].kp, image_keypoints, Scalar::all(-1), 4);
-        imshow("classify",image_keypoints);
-        waitKey(0);
-    }
-    */
+    
     //根据两组平面的匹配关系，对KeyPoint进行匹配
     //生成描述子    并 计算各关键点的3d位置
     for (size_t i = 0; i<planes1.size(); i++)
@@ -218,11 +192,11 @@ int main(int argc, char** argv)
     
     //分别匹配两组平面上的特征点
     cout<<"Using RANSAC to compute Transform Matrix."<<endl;
-    vector<TRANSFORM> transforms;
+    vector<Eigen::Isometry3d> transforms;
     for (size_t i=0; i<matches.size(); i++)
     {
         cout<<"solving plane1: "<<matches[i].queryIdx<<" with plane2: "<<matches[i].trainIdx<<endl;
-        TRANSFORM t = PnP( planes1[matches[i].queryIdx], planes2[matches[i].trainIdx] );
+        Eigen::Isometry3d t = PnP( planes1[matches[i].queryIdx], planes2[matches[i].trainIdx] );
         transforms.push_back(t);
 
         //Eigen::Matrix4f T = PnPUsingICP( planes1[matches[i].queryIdx], planes2[matches[i].trainIdx] );
@@ -233,10 +207,51 @@ int main(int argc, char** argv)
     for (size_t i =0; i<transforms.size(); i++)
     {
         cout<<"T"<<i<<" = "<<endl;
-        cout<<"R="<<transforms[i].rvec<<endl;
-        cout<<"t="<<transforms[i].tvec<<endl;
+        cout<<transforms[i].matrix()<<endl;
     }
 
+    //构造g2o的图
+    cout<<"init g2o"<<endl;
+    SlamLinearSolver* linearSolver = new SlamLinearSolver();
+    linearSolver->setBlockOrdering( false );
+    SlamBlockSolver* blockSolver = new SlamBlockSolver( linearSolver );
+    OptimizationAlgorithmGaussNewton* solver = new OptimizationAlgorithmGaussNewton( blockSolver );
+    SparseOptimizer optimizer;
+    optimizer.setAlgorithm( solver );
+    VertexSE3* v1 = new VertexSE3();
+    VertexSE3* v2 = new VertexSE3();
+    v1->setId(0);    v2->setId(1);
+    v1->setEstimate( Eigen::Isometry3d::Identity() );
+    v2->setEstimate( Eigen::Isometry3d::Identity() );
+    v1->setFixed( true );
+    
+    optimizer.addVertex( v1 );
+    optimizer.addVertex( v2 );
+    //加入边
+    for (size_t i=0; i<transforms.size(); i++)
+    {
+        EdgeSE3* edge = new EdgeSE3();
+        edge->vertices() [0] = optimizer.vertex(0);
+        edge->vertices() [1] = optimizer.vertex(1);
+        edge->setMeasurement( transforms[i] );
+        Matrix<double, 6,6> information = Matrix<double, 6, 6>::Identity();
+        information(0, 0) = information(1,1) = information(2,2) = 100; //位置误差
+        information(3,3) = information(4,4) = information(5,5) = 100; //姿态误差
+        edge->setInformation( information );
+        optimizer.addEdge( edge );
+        
+    }
+
+    //开始优化
+    optimizer.setVerbose( true );
+    optimizer.initializeOptimization();
+    optimizer.optimize( 10 );
+
+    optimizer.save("./data/final.g2o");
+    VertexSE3* final = dynamic_cast<VertexSE3> (optmizer.vertex(1));
+    Eigen::Isometry3d esti = final->estimate();
+    cout<<"after g2o: "<<endl;
+    cout<<esti.matrix()<<endl;
     
     return 0;
 }
@@ -442,16 +457,13 @@ Mat extractDescriptor( Mat image, vector<KeyPoint>& kp)
     return descriptors;
 }
 
-TRANSFORM PnP(PLANE& p1, PLANE& p2)
+Eigen::Isometry3d PnP(PLANE& p1, PLANE& p2)
 {
     vector<DMatch> matches = match(p1.desp, p2.desp);
     cout<<"good matches: "<<matches.size()<<endl;
-
-
     //这是用cv的solvePnPRANSAC
     vector<Point3f> obj;  //目标点（cv坐标系下）
     vector<Point2f> img; //图像点（keypoints）
-    TRANSFORM t;
     for (size_t i=0; i<matches.size(); i++)
     {
         obj.push_back( g2o2cv(p1.kp_pos[matches[i].queryIdx]) );
@@ -468,8 +480,6 @@ TRANSFORM PnP(PLANE& p1, PLANE& p2)
     for (int i=0; i<inliers.rows; i++)
         inlierMatches.push_back( matches[inliers.at<int>(i,0)] );
     
-    t.rvec = rvec;
-    t.tvec = tvec;
     cout<<"inliers = "<<inliers.rows<<endl;
     if (inliers.rows < 5)
     {
@@ -480,8 +490,19 @@ TRANSFORM PnP(PLANE& p1, PLANE& p2)
     drawMatches(rgb1, p1.kp, rgb2, p2.kp, inlierMatches, image_matches, Scalar::all(-1), CV_RGB(255,255,255), Mat(), 4);
     imshow("match", image_matches);
     waitKey(0);
-    return t;
 
+    Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+    // 旋转向量转换成旋转矩阵
+    Mat R;
+    Rodrigues( rvec, R );
+    Eigen::Matrix3d r;
+    cv2eigen(R, r);
+
+    Eigen::AngleAxisd angle(r);
+    Eigen::Translation<double,3> trans(tvec.at<double>(0,0), tvec.at<double>(0,1), tvec.at<double>(0,2));
+    T = trans* angle;
+    
+    return T;
 }
 
 Eigen::Matrix4f PnPUsingICP(PLANE& p1, PLANE& p2)
