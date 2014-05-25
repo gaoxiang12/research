@@ -48,7 +48,7 @@ using namespace g2o;
 typedef pcl::PointXYZRGBA PointT;
 typedef pcl::PointCloud<PointT> PointCloud;
 
-typedef g2o::BlockSolver< BlockSolverTraits<-1,-1>> SlamBockSolver;
+typedef BlockSolver< BlockSolverTraits<-1, -1> >  SlamBlockSolver;
 typedef LinearSolverCSparse<SlamBlockSolver::PoseMatrixType> SlamLinearSolver;
 
 struct PLANE
@@ -63,7 +63,7 @@ struct PLANE
 //////////////////////////////////////////////////
 cv::Mat rgb1, rgb2, dep1, dep2; //data
 PointCloud::Ptr cloud1, cloud2;
-string dataPath = "/home/zero/code/dataset/slam/";
+string dataPath = "/home/y/code/dataset/slam/";
 vector<PLANE> planes1, planes2;
 
 //Parameters
@@ -248,7 +248,7 @@ int main(int argc, char** argv)
     optimizer.optimize( 10 );
 
     optimizer.save("./data/final.g2o");
-    VertexSE3* final = dynamic_cast<VertexSE3> (optmizer.vertex(1));
+    VertexSE3* final = dynamic_cast<VertexSE3*> (optimizer.vertex(1));
     Eigen::Isometry3d esti = final->estimate();
     cout<<"after g2o: "<<endl;
     cout<<esti.matrix()<<endl;
@@ -500,7 +500,7 @@ Eigen::Isometry3d PnP(PLANE& p1, PLANE& p2)
 
     Eigen::AngleAxisd angle(r);
     Eigen::Translation<double,3> trans(tvec.at<double>(0,0), tvec.at<double>(0,1), tvec.at<double>(0,2));
-    T = trans* angle;
+    T = angle;
     
     return T;
 }
